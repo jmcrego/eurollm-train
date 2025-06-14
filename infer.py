@@ -7,6 +7,7 @@ from sacrebleu import corpus_bleu
 from transformers import TrainerCallback
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from EuroLLMDataset import create_eval_dataset
+from EuroLLMCallbacks import greedy
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Script to continue Pre-Training EuroLLM models.")
@@ -56,5 +57,5 @@ if __name__ == "__main__":
     eval_dataset = create_eval_dataset(args.eval_config, tokenizer, batch_size=args.per_device_batch_size, mask_id=args.mask_id)
 
     # === GREEDY GENERATIION ===
-    bleu = eval_greedy(model, tokenizer, eval_dataset, args.max_length, args.per_device_batch_size, "./kkout", target_language=args.target_language_sacrebleu)
+    bleu = greedy(model, tokenizer, eval_dataset, args.max_length, args.per_device_batch_size, "./kkout", target_language=args.target_language_sacrebleu)
     logger.info(f"SacreBLEU : {bleu}")
