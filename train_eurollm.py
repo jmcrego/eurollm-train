@@ -167,13 +167,12 @@ if __name__ == "__main__":
         args=training_args,
         train_dataset=[{}],  # dummy just to pass validation
         eval_dataset=[{}],   # dummy just to pass validation
-        data_collator=None,  #not needed
-        train_dataloader=train_loader,  # manually set
-        eval_dataloader=eval_loader, #manually set
+        data_collator=None,  # not needed, already collated from datasets
+        train_dataloader=train_loader,
+        eval_dataloader=eval_loader,
         callbacks=[log_callback, bleu_callback, save_callback],
     )
 
-    trainer.evaluate()
     resume_checkpoint_path = get_last_checkpoint(args.save_path)
     if resume_checkpoint_path:
         logger.info(f"Resuming training from {resume_checkpoint_path}")
@@ -190,16 +189,15 @@ if __name__ == "__main__":
 
     torch.cuda.empty_cache()
     torch.cuda.ipc_collect()
-    trainer.train(resume_from_checkpoint=resume_checkpoint_path if resume_checkpoint_path else None)
 
+    trainer.train(resume_from_checkpoint=resume_checkpoint_path if resume_checkpoint_path else None)
     trainer.evaluate()
     if trainer.is_world_process_zero():
         model.save_pretrained(os.path.join(args.save_path, "final"))
         tokenizer.save_pretrained(os.path.join(args.save_path, "final"))
 
     if args.lora:
-        # save full (merged) model
-        model.merge_and_unload()
+        model.merge_and_unload() # save full (merged) model
         model.save_pretrained(os.path.join(args.save_path, "merged_model"))
 
     logger.info("Done")

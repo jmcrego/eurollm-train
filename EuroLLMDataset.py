@@ -6,63 +6,9 @@ import logging
 import torch.nn.functional as F
 from collections import defaultdict
 from torch.utils.data import IterableDataset
-from transformers import AutoTokenizer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 logger = logging.getLogger("training")
-
-class EuroLLMDataCollator:
-    def __init__(self, tokenizer: AutoTokenizer, mask_id=-100, max_pad_per_example=None):
-        self._tokenizer = tokenizer
-        self._mask_id = mask_id
-        self._pad_token_id = tokenizer.pad_token_id
-        self._max_pad_per_example = max_pad_per_example
-
-        assert tokenizer.padding_side == "left", "tokenizer.padding_side should be 'left'"
-        assert tokenizer.pad_token_id == 2, "tokenizer.pad_token_id should be 2"
-
-    def __call__(self, features):
-        batch = {}
-
-        input_lens = [len(f["input_ids"]) for f in features]
-        input_pads = [max(input_lens) - l for l in input_lens]
-        if self._max_pad_per_example is not None and sum(input_pads) > len(input_lens) * self._max_pad_per_example:
-            logger.info(f"Skipping batch due to excessive padding lens: {input_lens} sum(pads): {sum(input_pads)}")
-            return None
-
-        input_ids = [torch.tensor(f["input_ids"], dtype=torch.long) for f in features]
-        labels = [torch.tensor(f["labels"], dtype=torch.long) for f in features]
-        attention_mask = [torch.tensor(f["attention_mask"], dtype=torch.long) for f in features]
-
-        padded = self._tokenizer.pad( {"input_ids": input_ids, "attention_mask": attention_mask}, padding=True, return_tensors="pt" )
-        batch["input_ids"] = padded["input_ids"]
-        batch["attention_mask"] = padded["attention_mask"]
-        
-        max_len = padded["input_ids"].shape[1]
-
-        padded_labels = [ torch.full((max_len - len(label),), self._mask_id, dtype=torch.long) if len(label) < max_len else torch.tensor([], dtype=torch.long) for label in labels ]
-        padded_labels = [ torch.cat([pad, label]) if pad.numel() > 0 else label for pad, label in zip(padded_labels, labels) ]
-        padded_labels = torch.stack(padded_labels)
-        batch["labels"] = padded_labels
-
-        if "prompt_ids" in features[0]: # Optional: if references present (eval set)
-            prompt_ids = [torch.tensor(f["prompt_ids"], dtype=torch.long) for f in features]
-            references = [torch.tensor(f["references"], dtype=torch.long) for f in features]
-            prompt_mask = [torch.tensor(f["prompt_mask"], dtype=torch.long) for f in features]            
-
-            padded = self._tokenizer.pad( {"input_ids": prompt_ids, "attention_mask": prompt_mask}, padding=True, return_tensors="pt" )
-            batch["prompt_ids"] = padded["input_ids"]
-            batch["prompt_mask"] = padded["attention_mask"]
-
-            padded_references = self.left_pad_sequence(references)
-            batch["references"] = padded_references
-
-        return batch
-
-    def left_pad_sequence(self, sequences):
-        reversed_seqs = [seq.flip(0) for seq in sequences]
-        padded = torch.nn.utils.rnn.pad_sequence(reversed_seqs, batch_first=True, padding_value=self._pad_token_id)
-        return padded.flip(dims=[1])
 
 
 class TextFileDataset(IterableDataset):
@@ -85,7 +31,7 @@ class TextFileDataset(IterableDataset):
                         "line": line.strip()
                     }
             nloops += 1
-            logger.info(f"Exhausted file {self._file} nloops:{nloops} nline:{nline}")
+            logger.info(f"Exhausted file {self._file} nloops:{nloops} nlines:{nline}")
             if not self._loop:
                 break
 
@@ -101,22 +47,17 @@ class PromptDataset(IterableDataset):
     def __iter__(self):
         prompt_template = self._prompt.replace('[source_language]', self._source_language).replace('[target_language]', self._target_language).strip()
         for source_item, target_item in zip(self._source_dataset, self._target_dataset):
-            assert source_item['nline'] == target_item['nline'], f"nline number does not match {source_item['nline']}!={target_item['nline']}"
-            nline = source_item["nline"]
-            source_file = source_item["file"]
-            target_file = target_item["file"]
-            source_sentence = source_item["line"]
-            target_sentence = target_item["line"]
+            assert source_item['nline'] == target_item['nline'], f"nline numbers do not match {source_item['nline']}!={target_item['nline']}"
             yield {
-                "source_file": source_file,
-                "target_file": target_file,
-                "nline": nline,
-                "source_sentence": source_sentence, 
-                "target_sentence": target_sentence,
+                "source_file": source_item["file"],
+                "target_file": target_item["file"],
+                "nline": source_item["nline"],
+                "source_sentence": source_item["line"], 
+                "target_sentence": target_item["line"],
                 "source_language": self._source_language, 
                 "target_language": self._target_language, 
-                "text": prompt_template.replace('[source_sentence]', source_sentence).replace('[target_sentence]', target_sentence),
-                "prompt": prompt_template.replace('[source_sentence]', source_sentence).replace('[target_sentence]', '')
+                "text":   prompt_template.replace('[source_sentence]', source_item["line"]).replace('[target_sentence]', target_item["line"]),
+                "prompt": prompt_template.replace('[source_sentence]', source_item["line"]).replace('[target_sentence]', '')
             }
 
 class EncodeDataset(IterableDataset):
@@ -128,40 +69,52 @@ class EncodeDataset(IterableDataset):
 
     def __iter__(self):
         for e in self._dataset:
-            encodings = self._tokenizer(e['text'], padding=False, truncation=False, add_special_tokens=False, return_offsets_mapping=True, return_tensors=None)            
-            input_ids = [self._tokenizer.bos_token_id] + encodings['input_ids'] + [self._tokenizer.eos_token_id]
-            labels = [self._mask_id] + self._mask_labels(encodings, e['prompt']) + [self._tokenizer.eos_token_id]
-            e["input_ids"] = input_ids
-            e["attention_mask"] = [1] * len(input_ids)
-            e["labels"] = labels
+            input_ids = self._tokenize(e['text'])
+            prompt_ids = self._tokenize(e['prompt'])
+            # Prepend <s>, append </s> input_ids/labels manually         
+            labels    = [self._mask_id]                + self._mask_labels(input_ids, prompt_ids) + [self._tokenizer.eos_token_id]
+            input_ids = [self._tokenizer.bos_token_id] + input_ids                                + [self._tokenizer.eos_token_id]
             assert len(input_ids) == len(labels), f"input_ids/labels different lengths!! {len(input_ids)}!={len(labels)}"
+            e["input_ids"] = input_ids                 #[<s>Translate from English into French:\nInput:\nMy father\nOutput:\nMon père</s>]
+            e["labels"] = labels                       #[-100, -100, -100, -100,            ...,                       -100, Mon père</s>]
+            e["attention_mask"] = [1] * len(input_ids) #all tokens are attended (unmasked), no padding yet
             if self._is_eval:
-                encodings = self._tokenizer(e['prompt'], padding=False, truncation=False, add_special_tokens=False, return_offsets_mapping=True, return_tensors=None)            
-                prompt_ids = [self._tokenizer.bos_token_id] + encodings['input_ids']
-                encodings = self._tokenizer(e['target_sentence'], padding=False, truncation=False, add_special_tokens=False, return_offsets_mapping=True, return_tensors=None)
-                references = encodings['input_ids'] + [self._tokenizer.eos_token_id]
-                e["prompt_ids"] = prompt_ids
-                e["references"] = references
-                e["prompt_mask"] = [1] * len(prompt_ids)
+                target_ids = self._tokenize(e['target_sentence'])
+                e["prompt_ids"]  = [self._tokenizer.bos_token_id] + prompt_ids #[<s>Translate from English into French:\nInput:\nMy father\nOutput:\n]
+                e["prompt_mask"] = [1] * (len(e["prompt_ids"]))                #[1, 1, 1, 1,            ...,                                        1] #all tokens are attended (no padding yet).
+                e["references"]  = target_ids + [self._tokenizer.eos_token_id] #[Mon père</s>]
+            #self._log(e)
             yield e
 
-    def _mask_labels(self, encodings, prompt):
-        """ Masks the labels so that loss is computed only on tokens *after* the prompt. """
-        labels = encodings['input_ids'].copy()
-        if self._mask_id == 0:
-            return labels
-        prompt_end_char = len(prompt)  # since prompt is prefix starting at 0
-        for i, (start, end) in enumerate(encodings['offset_mapping']):
-            if end >= prompt_end_char:
-                for j in range(i+1): # should be +1 ???
-                    labels[j] = self._mask_id
-                return labels
+    def _log(self, e):
+        logger.info("")
+        logger.info(f"Sample {e['nline']}")
+        dec = self._detokenize(e['input_ids'])
+        logger.info(f"input_ids     : {e['input_ids']} ({len(e['input_ids'])}) {dec}")
+        dec = self._detokenize(e['labels'])
+        logger.info(f"labels        : {e['labels']} ({len(e['labels'])}) {dec}")
+        logger.info(f"attention_mask: {e['attention_mask']} ({len(e['attention_mask'])})")
+        if self._is_eval:
+            dec = self._detokenize(e['prompt_ids'])
+            logger.info(f"prompt_ids    : {e['prompt_ids']} ({len(e['prompt_ids'])}) {dec}")
+            logger.info(f"prompt_mask   : {e['prompt_mask']} ({len(e['prompt_mask'])})")
+            dec = self._detokenize(e['references'])
+            logger.info(f"references    : {e['references']} ({len(e['references'])}) {dec}")
+            logger.info(f"target_sent   : {e['target_sentence']}")
 
-        # if for any reason the ending char of prompt is not found in text, labels are returned unmasked
-        if not self.is_eval:
-            logger.info(f"Warning: unmasked prompt: {prompt}")
+    def _tokenize(self, txt):
+        return self._tokenizer(txt, padding=False, truncation=False, add_special_tokens=False, return_offsets_mapping=False, return_tensors=None)['input_ids']                
+
+    def _detokenize(self, ids):
+        clean_ids = [id for id in ids if id != self._mask_id]  # <- filter out mask_id
+        return self._tokenizer.decode(clean_ids, skip_special_tokens=False).replace('\n','⏎')
+
+    def _mask_labels(self, input_ids, prompt_ids):
+        labels = input_ids.copy()
+        if len(prompt_ids) > len(input_ids):
+            logger.warning(f"prompt_ids ({len(prompt_ids)}) shouldn't be larger than text_ids ({len(input_ids)})")
+        labels[:len(prompt_ids)] = [self._mask_id] * len(prompt_ids)
         return labels
-
 
 class FilterByLength(IterableDataset):
     def __init__(self, dataset, maximum_length):
@@ -204,12 +157,14 @@ class BatchDataset(IterableDataset):
         logger.info(f"built shard with {len(batchs)} batchs from {len(shard)} samples")
         return batchs
     
+
 class CollateDataset(IterableDataset):
-    def __init__(self, dataset, tokenizer, mask_id=-100, max_pad_per_example=None):
+    def __init__(self, dataset, tokenizer, mask_id=-100, max_avg_pad_per_sample=None):
         self._dataset = dataset
         self._tokenizer = tokenizer
+        self._pad_token_id = tokenizer.pad_token_id
         self._mask_id = mask_id
-        self._max_pad_per_example = max_pad_per_example
+        self._max_avg_pad_per_sample = max_avg_pad_per_sample
 
     def __iter__(self):
 
@@ -218,7 +173,7 @@ class CollateDataset(IterableDataset):
 
             input_lens = [len(f["input_ids"]) for f in lbatch]
             input_pads = [max(input_lens) - l for l in input_lens]
-            if self._max_pad_per_example is not None and sum(input_pads) > len(input_lens) * self._max_pad_per_example:
+            if self._max_avg_pad_per_sample is not None and sum(input_pads) > len(input_lens) * self._max_avg_pad_per_sample:
                 logger.info(f"Skipping batch due to excessive padding lens: {input_lens} sum(pads): {sum(input_pads)}")
                 continue
 
@@ -246,7 +201,35 @@ class CollateDataset(IterableDataset):
                 padded_references = self.left_pad_sequence(references)
                 batch["references"] = padded_references
 
+            #self._log(batch)
             yield batch
+
+    def _log(self, batch):
+        logger.info("********")
+        dec = self._detokenize(batch['input_ids'][0])
+        logger.info(f"input_ids     : {batch['input_ids'][0]} ({len(batch['input_ids'][0])}) {dec}")
+        dec = self._detokenize(batch['labels'][0])
+        logger.info(f"labels        : {batch['labels'][0]} ({len(batch['labels'][0])}) {dec}")
+        logger.info(f"attention_mask: {batch['attention_mask'][0]} ({len(batch['attention_mask'][0])})")
+        if "prompt_ids" in batch:
+            dec = self._detokenize(batch['prompt_ids'][0])
+            logger.info(f"prompt_ids    : {batch['prompt_ids'][0]} ({len(batch['prompt_ids'][0])}) {dec}")
+            logger.info(f"prompt_mask   : {batch['prompt_mask'][0]} ({len(batch['prompt_mask'][0])})")
+            dec = self._detokenize(batch['references'][0])
+            logger.info(f"references    : {batch['references'][0]} ({len(batch['references'][0])}) {dec}")
+
+    def _tokenize(self, txt):
+        return self._tokenizer(txt, padding=False, truncation=False, add_special_tokens=False, return_offsets_mapping=False, return_tensors=None)['input_ids']                
+
+    def _detokenize(self, ids):
+        clean_ids = [id for id in ids if id != self._mask_id]  # <- filter out mask_id
+        return self._tokenizer.decode(clean_ids, skip_special_tokens=False).replace('\n','⏎')
+
+
+    def left_pad_sequence(self, sequences):
+        reversed_seqs = [seq.flip(0) for seq in sequences]
+        padded = torch.nn.utils.rnn.pad_sequence(reversed_seqs, batch_first=True, padding_value=self._pad_token_id)
+        return padded.flip(dims=[1])
 
 
 class MergeDatasets(IterableDataset):
@@ -297,6 +280,7 @@ def create_training_dataset(
         batch_size=16,
         mask_id=-100,
         loop=False,
+        max_avg_pad_per_sample=15,
 ):
 
     assert tokenizer.bos_token_id == 1, 'tokenizer.bos_token_id should be 1'
@@ -304,7 +288,6 @@ def create_training_dataset(
     assert tokenizer.pad_token_id == 2, 'tokenizer.pad_token_id should be 2'
     assert tokenizer.padding_side == "left", 'tokenizer.padding_side should be \"left\"'
 
-    collator = EuroLLMDataCollator(tokenizer, mask_id=mask_id, max_pad_per_example=9)
     with open(config, "r", encoding="utf-8") as f:
         configs = json.load(f)        
 
@@ -332,7 +315,7 @@ def create_training_dataset(
     if len(datasets)>1:
         dataset = MergeDatasets(datasets, weights)
     dataset = BatchDataset(dataset, shard_size, batch_size, is_eval=False)
-    dataset = CollateDataset(dataset, tokenizer, mask_id=mask_id, max_pad_per_example=5)
+    dataset = CollateDataset(dataset, tokenizer, mask_id=mask_id, max_avg_pad_per_sample=max_avg_pad_per_sample)
     return dataset
 
 
@@ -342,6 +325,7 @@ def create_eval_dataset(
         maximum_length=0,
         batch_size=16,
         mask_id=-100,
+        max_avg_pad_per_sample=None,
 ):
 
     assert tokenizer.bos_token_id == 1, 'tokenizer.bos_token_id should be 1'
@@ -349,7 +333,6 @@ def create_eval_dataset(
     assert tokenizer.pad_token_id == 2, 'tokenizer.pad_token_id should be 2'
     assert tokenizer.padding_side == "left", 'tokenizer.padding_side should be \"left\"'
 
-    collator = EuroLLMDataCollator(tokenizer, mask_id=mask_id)
     with open(config, "r", encoding="utf-8") as f:
         configs = json.load(f)
         
@@ -365,7 +348,6 @@ def create_eval_dataset(
         prompt = config.get("prompt", None)
         weight = config.get("weight", 1.0)
         weights.append(weight)
-
         source_dataset = TextFileDataset(source_file, loop=False)
         target_dataset = TextFileDataset(target_file, loop=False)
         dataset = PromptDataset(prompt, source_language, target_language, source_dataset, target_dataset)
@@ -377,13 +359,14 @@ def create_eval_dataset(
     if len(datasets)>1:
         dataset = ConcatDatasets(datasets)
     dataset = BatchDataset(dataset, batch_size=batch_size, is_eval=True)
-    dataset = CollateDataset(dataset, tokenizer, mask_id=mask_id, max_pad_per_example=None)
+    dataset = CollateDataset(dataset, tokenizer, mask_id=mask_id, max_avg_pad_per_sample=max_avg_pad_per_sample)
     return dataset
 
 
 
 
 if __name__ == "__main__":
+    from transformers import AutoTokenizer
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     logger = logging.getLogger("training")
@@ -407,7 +390,6 @@ if __name__ == "__main__":
     dataloader = DataLoader(
         train_dataset,
         batch_size=batch_size, 
-        collate_fn=EuroLLMDataCollator(tokenizer),
         num_workers=1,
         pin_memory=True,
         timeout=10
@@ -421,7 +403,7 @@ if __name__ == "__main__":
             print(f"Batch {i} Example {j}")
             
             input_ids = batch["input_ids"][j].tolist()
-            dec = tokenizer.decode(input_ids, skip_special_tokens=False)#.replace('\n','\\n')
+            dec = tokenizer.decode(input_ids, skip_special_tokens=False)#.replace('\n','⏎')
             print(f"decode(input_ids) -->{dec}<--")
 
             #label_ids = batch["labels"][j].tolist()
