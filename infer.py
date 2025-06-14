@@ -1,78 +1,60 @@
-from vllm import LLM, SamplingParams
+import os
+import torch
 import logging
 import argparse
-import sacrebleu
-import torch
-import json
-import sys
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-logger = logging.getLogger("training")
-
-def get_bleu_tokenizer(target_language):
-    if target_language is None:
-        return "none"
-    elif target_language.lower() in {"ja", "japanese"}:
-        return "ja-mecab" #requires: pip install "sacrebleu[ja]"
-    elif target_language.lower() in {"zh", "chinese"}:
-        return "zh" #requires pip install "sacrebleu[zh]"
-    else:
-        return "none"  # fallback if texts are pre-tokenized
+from pathlib import Path
+from sacrebleu import corpus_bleu
+from transformers import TrainerCallback
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from EuroLLMDataset import create_eval_dataset
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Script to run inference of EuroLLM models using vLLM.")
-    parser.add_argument("-m", type=str, default="/lustre/fsmisc/dataset/HuggingFace_Models/utter-project/EuroLLM-1.7B", help="Path where the EuroLLM model is found.")
-    parser.add_argument("-t", type=str, default=None, help="Path where the EuroLLM tokenizer is found (if different to -m).")
-    parser.add_argument("-i", type=str, required=True, help="Input file path.")
-    parser.add_argument("-o", type=str, default=None, help="Output file path.")
-    parser.add_argument("-r", type=str, default=None, help="Reference file path.")
-    parser.add_argument("-sl", type=str, required=True, help="Source language.")
-    parser.add_argument("-tl", type=str, required=True, help="Target language.")
-    parser.add_argument("--max_tokens", type=int, default=512, help="Max sequence length.")
-    parser.add_argument("--batch_size", type=int, default=16, help="Per device batch size.")
-    parser.add_argument("--bleu", action='store_true', help="Run sacrebleu evaluation.")
-    parser.add_argument("--comet", action='store_true', help="Run comet evaluation.")
+    parser = argparse.ArgumentParser(description="Script to continue Pre-Training EuroLLM models.")
+    parser.add_argument("--model_path", type=str, default="/lustre/fsmisc/dataset/HuggingFace_Models/utter-project/EuroLLM-1.7B", help="Path to the EuroLLM model.")
+    parser.add_argument("--eval_config", type=str, required=True, help="Eval json config file.")
+    parser.add_argument("--target_language_sacrebleu", type=str, default=None, help="target language for sacrebleu string tokenizer.")
+    parser.add_argument("--per_device_batch_size", type=int, default=16, help="Per device batch size.")
+    parser.add_argument("--mask_id", type=int, default=-100, help="Id used to mask the prompt when learning (compute loss over target only).")
+    parser.add_argument("--max_length", type=int, default=512, help="Max sequence length.")
+    parser.add_argument("--seed", type=int, default=0, help="Seed for randomness in training dataset/s.")
+    parser.add_argument("--bf16", action='store_true', help="Use torch_dtype=torch.bfloat16.")
+    parser.add_argument("--fp16", action='store_true', help="Use torch_dtype=torch.float16.")
     args = parser.parse_args()
 
-    # Initialize vLLM with your local model
-    llm = LLM(model=args.m, tokenizer=args.t if args.t is None else args.m, trust_remote_code=True, dtype="bfloat16")  # or "float16" if needed
+    # === LOAD TOKENIZER ===
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=True)
+    tokenizer.padding_side = 'left'
+    tokenizer.pad_token = tokenizer.eos_token
+    logger.info(f"Loaded tokenizer {args.model_path}")
+    logger.info(f"Tokenizer BOS token id: {tokenizer.bos_token_id}: {tokenizer.bos_token}")
+    logger.info(f"Tokenizer EOS token id: {tokenizer.eos_token_id}: {tokenizer.eos_token}")
+    logger.info(f"Tokenizer PAD token id: {tokenizer.pad_token_id}: {tokenizer.pad_token}")
+    logger.info(f"Tokenizer padding_side: {tokenizer.padding_side}")
+    #set_seed
 
-    prompts = []
-    with open(args.i, 'r') as fd:
-        for line in fd:
-            prompts.append(f"Translate from {args.sl} to {args.tl}:\nInput:\n{line.strip()}\nOutput:\n")
+    if args.bf16:
+        if torch.cuda.is_bf16_supported():
+            dtype = torch.bfloat16
+        else:
+            logger.warning("BF16 requested but not supported on this hardware. Falling back to float32.")
+            dtype = torch.float32
+    elif args.fp16:
+        dtype = torch.float16
+    else:
+        dtype = torch.float32
+    logger.info(f"dtype is {dtype}")
 
-    refs = []
-    if args.r is not None:
-        with open(args.r, 'r') as fd:
-            for line in fd:
-                refs.append(line.strip())
+    # === LOAD MODEL ===
+    model = AutoModelForCausalLM.from_pretrained(args.model_path, torch_dtype=dtype, device_map="auto")
+    model.config.pad_token_id = tokenizer.pad_token_id
+    logger.info(f"Loaded model from pretrained {args.model_path}")
+    logger.info(f"Model dtype={next(model.parameters()).dtype}")
+    logger.info(f"Model config BOS token id: {model.config.bos_token_id}")
+    logger.info(f"Model config PAD token id: {model.config.pad_token_id}")
 
+    # === LOAD DATASET ===
+    eval_dataset = create_eval_dataset(args.eval_config, tokenizer, batch_size=args.per_device_batch_size, mask_id=args.mask_id)
 
-    #sampling_params_greedy = SamplingParams( temperature=0.0, max_tokens=args.max_tokens, stop=["\n", "</s>"] )
-    #sampling_params_beams5 = SamplingParams(use_beam_search=True, max_tokens=args.max_tokens, num_beams=5, early_stopping=True, stop=["\n", "</s>"])
-    sampling_params_random = SamplingParams( temperature=0.7, top_p=0.9, top_k=50, max_tokens=args.max_tokens, stop=["\n", "</s>"], seed=42)
-    outputs = llm.generate(prompts, sampling_params_random) # Run inference
-    
-    hyps = []
-    for i in range(len(prompts)):
-        prompt = prompts[i].replace("\n","\\n")
-        output = outputs[i].outputs[0].text.strip()
-        hyps.append(output)
-        print(f"Prompt: {prompt}")
-        print(f"Output: {output}")
-        if len(refs):
-            ref = refs[i]
-            print(f"Ref   : {ref}")
-        print("-" * 40)
-
-    if args.o is not None:
-        with open(args.o, 'w') as fd:
-            for h in hyps:
-                fd.write(h + '\n')
-        
-    if args.bleu and len(refs):
-        assert len(hyps) == len(refs), "Number of hypotheses and references must match."
-        bleu = sacrebleu.corpus_bleu(hyps, [refs], tokenize=get_bleu_tokenizer(args.tl))
-        print(f"SacreBLEU score: {bleu.score:.2f} {args.m}")
-
+    # === GREEDY GENERATIION ===
+    bleu = eval_greedy(model, tokenizer, eval_dataset, args.max_length, args.per_device_batch_size, "./kkout", target_language=args.target_language_sacrebleu)
+    logger.info(f"SacreBLEU : {bleu}")
