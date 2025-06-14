@@ -79,10 +79,11 @@ class EncodeDataset(IterableDataset):
             e["labels"] = labels                       #[-100, -100, -100, -100,            ...,                       -100, Mon père</s>]
             e["attention_mask"] = [1] * len(input_ids) #all tokens are attended (unmasked), no padding yet
             if self._is_eval:
-                target_ids = self._tokenize(e['target_sentence'])
                 e["prompt_ids"]  = [self._tokenizer.bos_token_id] + prompt_ids #[<s>Translate from English into French:\nInput:\nMy father\nOutput:\n]
                 e["prompt_mask"] = [1] * (len(e["prompt_ids"]))                #[1, 1, 1, 1,            ...,                                        1] #all tokens are attended (no padding yet).
-                e["references"]  = target_ids + [self._tokenizer.eos_token_id] #[Mon père</s>]
+                if 'target_sentence' in e:
+                    target_ids = self._tokenize(e['target_sentence'])
+                    e["references"]  = target_ids + [self._tokenizer.eos_token_id] #[Mon père</s>]
             #self._log(e)
             yield e
 
@@ -191,15 +192,16 @@ class CollateDataset(IterableDataset):
             padded_labels = torch.stack(padded_labels)
             batch["labels"] = padded_labels
 
-            if "prompt_ids" in lbatch[0]: # Optional: if references present (eval set)
+            if "prompt_ids" in lbatch[0]: # Optional: if eval set
                 prompt_ids = [torch.tensor(f["prompt_ids"], dtype=torch.long) for f in lbatch]
-                references = [torch.tensor(f["references"], dtype=torch.long) for f in lbatch]
-                prompt_mask = [torch.tensor(f["prompt_mask"], dtype=torch.long) for f in lbatch]            
+                prompt_mask = [torch.tensor(f["prompt_mask"], dtype=torch.long) for f in lbatch]     
                 padded = self._tokenizer.pad( {"input_ids": prompt_ids, "attention_mask": prompt_mask}, padding=True, return_tensors="pt" )
                 batch["prompt_ids"] = padded["input_ids"]
                 batch["prompt_mask"] = padded["attention_mask"]
-                padded_references = self.left_pad_sequence(references)
-                batch["references"] = padded_references
+                if 'references' in lbatch[0]:
+                    references = [torch.tensor(f["references"], dtype=torch.long) for f in lbatch]
+                    padded_references = self.left_pad_sequence(references)
+                    batch["references"] = padded_references
 
             #self._log(batch)
             yield batch
@@ -362,6 +364,41 @@ def create_eval_dataset(
     dataset = CollateDataset(dataset, tokenizer, mask_id=mask_id, max_avg_pad_per_sample=max_avg_pad_per_sample)
     return dataset
 
+
+def create_test_dataset(
+    file_path,
+    source_language,
+    target_language,
+    prompt,
+    tokenizer,
+    batch_size=16,
+    mask_id=-100,
+):
+
+    assert tokenizer.bos_token_id == 1, 'tokenizer.bos_token_id should be 1'
+    assert tokenizer.eos_token_id == 2, 'tokenizer.eos_token_id should be 2'
+    assert tokenizer.pad_token_id == 2, 'tokenizer.pad_token_id should be 2'
+    assert tokenizer.padding_side == "left", 'tokenizer.padding_side should be \"left\"'
+
+    prompt_template = prompt.replace('[source_language]', source_language).replace('[target_language]', target_language).strip()
+
+    dataset = []
+    with open(file_path, "r", encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            e = {
+#                'source_language': source_language,
+#                'target_language': target_language,
+#                'source_sentence': line.strip(),
+#                'nline': i+1,
+                "prompt": prompt_template.replace('[source_sentence]', line.strip()).replace('[target_sentence]', ''),
+                "text":   prompt_template.replace('[source_sentence]', line.strip()), ### not to be used for testing ([target_sentence] remains in prompt)
+            }
+            dataset.append(e)
+
+    dataset = EncodeDataset(dataset, tokenizer, mask_id=mask_id, is_eval=True)
+    dataset = BatchDataset(dataset, batch_size=batch_size, is_eval=True)
+    dataset = CollateDataset(dataset, tokenizer, mask_id=mask_id)
+    return dataset
 
 
 

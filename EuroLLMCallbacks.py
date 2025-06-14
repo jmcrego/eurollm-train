@@ -36,8 +36,7 @@ class CustomBLEUCallback(TrainerCallback):
         output_file = f"{args.output_dir}/eval.{state.global_step}"
         bleu = greedy(model, self.tokenizer, self.eval_dataset, max_length=self.max_length, batch_size=self.batch_size, output_file=output_file, target_language=self.target_language)
         logger.info(f"[Eval @ step {state.global_step}] SacreBLEU: {bleu:.2f}")
-        # Log the BLEU score into Trainer state
-        state.log_history.append({
+        state.log_history.append({ # Log the BLEU score into Trainer state
             "eval_sacrebleu": bleu,
             "step": state.global_step,
         })
