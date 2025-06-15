@@ -1,27 +1,19 @@
 import os
 import torch
-import random
 import logging
 import argparse
-import numpy as np
 from datetime import datetime
 from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer
 from EuroLLMDataset import create_training_dataset, create_eval_dataset
 from EuroLLMCallbacks import CustomBLEUCallback, LogStepCallback, SaveTokenizerCallback
 from torch.utils.data import DataLoader
 from transformers.trainer_utils import get_last_checkpoint
+from utils import set_seed
 
 #transformers.logging.set_verbosity_warning() #This will suppress their internal INFO level logs (only LogStepCallback is used)
 os.environ["TOKENIZERS_PARALLELISM"] = "false" #prevents a warning
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 logger = logging.getLogger("training")
-
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
 
 class CustomTrainer(Trainer):
     def __init__(self, *args, train_dataloader=None, eval_dataloader=None, **kwargs):
@@ -57,7 +49,7 @@ if __name__ == "__main__":
     parser.add_argument("--shard_size", type=int, default=64000, help="Number of lines in a shard.")
     parser.add_argument("--mask_id", type=int, default=-100, help="Id used to mask the prompt when learning (compute loss over target only).")
     parser.add_argument("--target_language_sacrebleu", type=str, default=None, help="target language for sacrebleu string tokenizer.")
-    parser.add_argument("--seed", type=int, default=0, help="Seed for randomness in training dataset/s.")
+    parser.add_argument("--seed", type=int, default=0, help="Seed for randomness.")
     parser.add_argument("--loop", action='store_true', help="Loop on training dataset/s.")
     parser.add_argument("--grad_ckpt", action='store_true', help="Enable gradient checkpointing")
     parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Clip gradients to max_grad_norm")
@@ -97,6 +89,10 @@ if __name__ == "__main__":
     else:
         dtype = torch.float32
     logger.info(f"dtype is {dtype}")
+
+    #Clear cache before model loading
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
 
     model = AutoModelForCausalLM.from_pretrained(args.model_path, torch_dtype=dtype)
     model.config.pad_token_id = tokenizer.pad_token_id
@@ -186,9 +182,6 @@ if __name__ == "__main__":
             logger.info(f"  Reserved : {torch.cuda.memory_reserved(i) / 1024**2:.2f} MB")
             logger.info(f"  Free     : {(torch.cuda.memory_reserved(i) - torch.cuda.memory_allocated(i)) / 1024**2:.2f} MB")
 
-
-    torch.cuda.empty_cache()
-    torch.cuda.ipc_collect()
 
     trainer.train(resume_from_checkpoint=resume_checkpoint_path if resume_checkpoint_path else None)
     trainer.evaluate()

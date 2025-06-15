@@ -2,7 +2,7 @@ import logging
 import argparse
 import torch
 import time
-from utils import run_bleu, run_comet, greedy
+from utils import run_bleu, run_comet, greedy, set_seed
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 logger = logging.getLogger("training")
@@ -94,7 +94,11 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=16, help="Per device batch size.")
     parser.add_argument("--bleu", action='store_true', help="Run sacrebleu evaluation.")
     parser.add_argument("--comet", action='store_true', help="Run comet evaluation.")
+    parser.add_argument("--seed", type=int, default=0, help="Seed for randomness.")
     args = parser.parse_args()
+
+    if args.seed:
+        set_seed(args.seed)
 
     tic = time.time()
     if args.engine.lower() == 'vllm':

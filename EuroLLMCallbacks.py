@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 from sacrebleu import corpus_bleu
 from transformers import TrainerCallback
+from utils import greedy, run_bleu
         
 logger = logging.getLogger("training")
 
@@ -33,16 +34,22 @@ class CustomBLEUCallback(TrainerCallback):
         self.target_language = target_language
 
     def on_evaluate(self, args, state, control, model=None, **kwargs):
-        output_file = f"{args.output_dir}/eval.{state.global_step}"
-        bleu = greedy(model, self.tokenizer, self.eval_dataset, max_length=self.max_length, batch_size=self.batch_size, output_file=output_file, target_language=self.target_language)
+        refs = [ref for b in self.eval_dataset for ref in self.tokenizer.batch_decode(b["references"], skip_special_tokens=True)]
+        hyps = greedy(model, self.tokenizer, self.eval_dataset, max_length=self.max_length)
+        bleu = run_bleu(hyps, refs, target_language=self.target_language)
+        # Save file
+        path = Path(f"{args.output_dir}/eval.{state.global_step}.{bleu:.2f}.out")    
+        if path.parent != Path("."): # Create directory only if it's not the current one
+            path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f: 
+            for hyp in hyps:
+                f.write(hyp + "\n")
+        # Log the BLEU score into Trainer state
         logger.info(f"[Eval @ step {state.global_step}] SacreBLEU: {bleu:.2f}")
-        state.log_history.append({ # Log the BLEU score into Trainer state
-            "eval_sacrebleu": bleu,
-            "step": state.global_step,
-        })
+        state.log_history.append({ "eval_sacrebleu": bleu, "step": state.global_step })
         return control
 
-def greedy(model, tokenizer, eval_dataset, max_length, batch_size, output_file, target_language=None):
+def greedy2(model, tokenizer, eval_dataset, max_length, batch_size, output_file, target_language=None):
     model.eval()
     device = next(model.parameters()).device
     refs = []
@@ -93,7 +100,7 @@ def greedy(model, tokenizer, eval_dataset, max_length, batch_size, output_file, 
 
     return bleu
 
-def get_bleu_tokenizer(target_language):
+def get_bleu_tokenizer2(target_language):
     if target_language is None:
         return "none"
     elif target_language.lower() in {"ja", "japanese"}:
@@ -102,4 +109,5 @@ def get_bleu_tokenizer(target_language):
         return "zh" #requires pip install "sacrebleu[zh]"
     else:
         return "none"  # fallback if texts are pre-tokenized
+
 

@@ -386,10 +386,6 @@ def create_test_dataset(
     with open(file_path, "r", encoding="utf-8") as f:
         for i, line in enumerate(f):
             e = {
-#                'source_language': source_language,
-#                'target_language': target_language,
-#                'source_sentence': line.strip(),
-#                'nline': i+1,
                 "prompt": prompt_template.replace('[source_sentence]', line.strip()).replace('[target_sentence]', ''),
                 "text":   prompt_template.replace('[source_sentence]', line.strip()), ### not to be used for testing ([target_sentence] remains in prompt)
             }
