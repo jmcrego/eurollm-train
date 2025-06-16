@@ -5,7 +5,7 @@ import argparse
 from datetime import datetime
 from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer
 from EuroLLMDataset import create_training_dataset, create_eval_dataset
-from EuroLLMCallbacks import CustomBLEUCallback, LogStepCallback, SaveTokenizerCallback
+from EuroLLMCallbacks import CustomBLEUCallback, LogStepCallback, SaveTokenizerCallback, SaveBestBLEUCheckpoints
 from torch.utils.data import DataLoader
 from transformers.trainer_utils import get_last_checkpoint
 from utils import set_seed
@@ -123,21 +123,25 @@ if __name__ == "__main__":
         per_device_eval_batch_size=max(1, args.per_device_batch_size // 2),
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         max_steps=args.max_steps,
-        eval_strategy="steps",
-        eval_steps=args.eval_steps,
-        save_strategy="steps",
-        save_steps=args.save_steps,
-        save_total_limit=args.save_total_limit,
-        load_best_model_at_end=True,
-        metric_for_best_model="loss", 
-        greater_is_better=False,
         learning_rate=args.learning_rate,
+        max_grad_norm=args.max_grad_norm,
+        # Evaluation settings (must match save settings)
+        evaluation_strategy="steps",
+        eval_steps=args.eval_steps,
+        # Save settings (must match eval settings)
+        save_strategy="steps",
+        save_steps=args.eval_steps,  # Same as eval_steps
+        save_total_limit=1, #use minimum (we'll handle it ourselves via SaveBestBLEUCheckpoints callback)
+        # BLEU-based model selection
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_sacrebleu",
+        greater_is_better=True,
+        # Other settings
         logging_dir=os.path.join(args.save_path, "logs"),
         logging_steps=args.logging_steps,
         bf16=args.bf16,
         fp16=args.fp16,
         disable_tqdm=True,
-        max_grad_norm=args.max_grad_norm,
         ignore_data_skip=True, #to allow raising Value in data collator (it prevents from skipping batchs when fine tuning after n iterations)
         remove_unused_columns=False,
         report_to="none", #"tensorboard",
@@ -155,7 +159,8 @@ if __name__ == "__main__":
     # === CALLBACKS ===
     log_callback = LogStepCallback()
     bleu_callback = CustomBLEUCallback(tokenizer, eval_dataset, max_length=args.max_length, batch_size=args.per_device_batch_size, target_language=args.target_language_sacrebleu)
-    save_callback = SaveTokenizerCallback(tokenizer)
+    save_tokenizer_callback = SaveTokenizerCallback(tokenizer)
+    bleu_checkpoint_callback = SaveBestBLEUCheckpoints(save_total_limit=args.save_total_limit)
 
     # === INIT TRAINER ===
     trainer = CustomTrainer(
@@ -166,7 +171,7 @@ if __name__ == "__main__":
         data_collator=None,  # not needed, already collated from datasets
         train_dataloader=train_loader,
         eval_dataloader=eval_loader,
-        callbacks=[log_callback, bleu_callback, save_callback],
+        callbacks=[log_callback, bleu_callback, save_tokenizer_callback, bleu_checkpoint_callback],
     )
 
     resume_checkpoint_path = get_last_checkpoint(args.save_path)

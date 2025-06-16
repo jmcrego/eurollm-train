@@ -1,6 +1,7 @@
 import os
 import torch
 import logging
+import shutil
 from pathlib import Path
 from sacrebleu import corpus_bleu
 from transformers import TrainerCallback
@@ -44,70 +45,67 @@ class CustomBLEUCallback(TrainerCallback):
         with open(path, "w", encoding="utf-8") as f: 
             for hyp in hyps:
                 f.write(hyp + "\n")
-        # Log the BLEU score into Trainer state
+
+        # Log the BLEU score in two places:
+        # 1. In log_history (for your tracking)
+        if not hasattr(state, 'log_history'):
+            state.log_history = []
+        state.log_history.append({"eval_sacrebleu": bleu, "step": state.global_step})
+        # 2. Return it in metrics (for Trainer's best model tracking)
+        if metrics := kwargs.get('metrics', None):
+            metrics['eval_sacrebleu'] = bleu
+        
         logger.info(f"[Eval @ step {state.global_step}] SacreBLEU: {bleu:.2f}")
-        state.log_history.append({ "eval_sacrebleu": bleu, "step": state.global_step })
         return control
 
-def greedy2(model, tokenizer, eval_dataset, max_length, batch_size, output_file, target_language=None):
-    model.eval()
-    device = next(model.parameters()).device
-    refs = []
-    hyps = []
+class SaveBestBLEUCheckpoints(TrainerCallback):
+    def __init__(self, save_total_limit=5):
+        super().__init__()
+        self.save_total_limit = save_total_limit
+        
+def get_checkpoints(self, state, output_dir):
+    """Returns sorted list of (bleu_score, path, step) for existing checkpoints"""
+    checkpoints = []
+    output_path = Path(output_dir)
+    
+    # First get all existing checkpoint steps
+    existing_steps = set()
+    for item in output_path.iterdir():
+        if item.is_dir() and item.name.startswith('checkpoint-'):
+            try:
+                step = int(item.name.split('-')[1])
+                existing_steps.add(step)
+            except (ValueError, IndexError):
+                continue
+    
+    # Then match with log_history
+    for entry in reversed(state.log_history):
+        if 'eval_sacrebleu' in entry and 'step' in entry:
+            step = entry['step']
+            if step in existing_steps:
+                checkpoints.append((entry['eval_sacrebleu'], str(output_path / f"checkpoint-{step}"), step))
+    
+    return sorted(checkpoints, key=lambda x: (-x[0], x[2]))
 
-    with torch.no_grad():
-        n = 0
-        for i, batch in enumerate(eval_dataset):
-            batch = {k: v.to(device) for k, v in batch.items()}
-            input_ids = batch["prompt_ids"]
-            attention_mask = batch["prompt_mask"]
-            labels = batch["references"]
-            
-            prompt_len = len(input_ids[0])
-            input_ids = input_ids.to(device)
-            labels = labels.to(device)
-            attention_mask = attention_mask.to(device)
-            generated_ids = model.generate(input_ids=input_ids, attention_mask=attention_mask, max_length=max_length, pad_token_id=tokenizer.pad_token_id, do_sample=False)
-            for j in range(input_ids.size(0)):
-                n += 1
-                # === strings ===
-                input_str = tokenizer.decode(input_ids[j], skip_special_tokens=True).replace("\n", "⏎")
-                prediction_str = tokenizer.decode(generated_ids[j][prompt_len:], skip_special_tokens=True).replace("\n", "⏎") #remove prompt
-                reference_str = tokenizer.decode(labels[j], skip_special_tokens=True).replace("\n", "⏎")
-                refs.append(reference_str)
-                hyps.append(prediction_str)
+    def on_step_end(self, args, state, control, **kwargs):
+        # Only run at eval steps
+        if state.global_step % args.eval_steps != 0:
+            return
+        checkpoints = self.get_checkpoints(state, args.output_dir)
+        logger.info(f"Available checkpoints: {checkpoints}")
+        current_path = Path(args.output_dir) / f"checkpoint-{state.global_step}"
+        logger.info(f"Preparing to save checkpoint: {current_path}")
+        # Always allow the Trainer to save (we'll clean up afterwards)
+        control.should_save = True
+        # Clean up old checkpoints if needed
+        if len(checkpoints) >= self.save_total_limit:
+            # Keep top N-1 plus the new one we're about to save
+            for _, path, _ in checkpoints[self.save_total_limit-1:]:
+                if Path(path).exists():
+                    shutil.rmtree(path)
+                    logger.info(f"Removed old checkpoint {path} to maintain limit")
+        return control
 
-                logger.info(f"[Sample {n}]")
-                #logger.info(f"Prompt [{len(input_ids[j])}]: {input_ids[j]}")
-                #logger.info(f"Mask [{len(attention_mask[j])}]: {attention_mask[j]}")
-                #logger.info(f"Ref    [{len(labels[j])}]: {labels[j]}")
-                #logger.info(f"Hyp    [{len(generated_ids[j])}]: {generated_ids[j]}")
-                #logger.info(f"Prompt : {input_str}")
-                logger.info(f"Ref    : {reference_str}")
-                logger.info(f"Hyp    : {prediction_str}")
 
-    # BLEU computation
-    bleu = 0.00
-    if len(hyps) > 0:
-        bleu = corpus_bleu(hyps, [refs], tokenize=get_bleu_tokenizer(target_language)).score
-
-    path = Path(f"{output_file}.{bleu:.2f}.out")    
-    if path.parent != Path("."): # Create directory only if it's not the current one
-        path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f: # Write hypotheses
-        for hyp in hyps:
-            f.write(hyp + "\n")
-
-    return bleu
-
-def get_bleu_tokenizer2(target_language):
-    if target_language is None:
-        return "none"
-    elif target_language.lower() in {"ja", "japanese"}:
-        return "ja-mecab" #requires: pip install "sacrebleu[ja]"
-    elif target_language.lower() in {"zh", "chinese"}:
-        return "zh" #requires pip install "sacrebleu[zh]"
-    else:
-        return "none"  # fallback if texts are pre-tokenized
 
 
