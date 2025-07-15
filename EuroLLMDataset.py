@@ -49,9 +49,9 @@ class PromptDataset(IterableDataset):
         for source_item, target_item in zip(self._source_dataset, self._target_dataset):
             assert source_item['nline'] == target_item['nline'], f"nline numbers do not match {source_item['nline']}!={target_item['nline']}"
             yield {
-                "source_file": source_item["file"],
-                "target_file": target_item["file"],
-                "nline": source_item["nline"],
+#                "source_file": source_item["file"],
+#                "target_file": target_item["file"],
+#                "nline": source_item["nline"],
                 "source_sentence": source_item["line"], 
                 "target_sentence": target_item["line"],
                 "source_language": self._source_language, 

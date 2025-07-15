@@ -32,7 +32,7 @@ class CustomTrainer(Trainer):
         return super().get_eval_dataloader(eval_dataset)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Script to continue Pre-Training EuroLLM models.")
+    parser = argparse.ArgumentParser(description="Script to continue Pre-Training EuroLLM models.", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--model_path", type=str, default="/lustre/fsmisc/dataset/HuggingFace_Models/utter-project/EuroLLM-1.7B", help="Path to the EuroLLM model.")
     parser.add_argument("--save_path", type=str, default="./EuroLLM-1.7B-CPT", help="Path where the model will be saved.")
     parser.add_argument("--train_config", type=str, default="data/train/train.json", help="Training json config file.")
