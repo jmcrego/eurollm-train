@@ -46,12 +46,10 @@ class CustomBLEUCallback(TrainerCallback):
             for hyp in hyps:
                 f.write(hyp + "\n")
 
-        # Log the BLEU score in two places:
-        # 1. In log_history (for your tracking)
+        # Log the BLEU score in two places: in log_history (for your tracking), in metrics (for Trainer's best model tracking)
         if not hasattr(state, 'log_history'):
             state.log_history = []
         state.log_history.append({"eval_sacrebleu": bleu, "step": state.global_step})
-        # 2. Return it in metrics (for Trainer's best model tracking)
         if metrics := kwargs.get('metrics', None):
             metrics['eval_sacrebleu'] = bleu
         
@@ -63,29 +61,29 @@ class SaveBestBLEUCheckpoints(TrainerCallback):
         super().__init__()
         self.save_total_limit = save_total_limit
         
-def get_checkpoints(self, state, output_dir):
-    """Returns sorted list of (bleu_score, path, step) for existing checkpoints"""
-    checkpoints = []
-    output_path = Path(output_dir)
+    def get_checkpoints(self, state, output_dir):
+        """Returns sorted list of (bleu_score, path, step) for existing checkpoints"""
+        checkpoints = []
+        output_path = Path(output_dir)
     
-    # First get all existing checkpoint steps
-    existing_steps = set()
-    for item in output_path.iterdir():
-        if item.is_dir() and item.name.startswith('checkpoint-'):
-            try:
-                step = int(item.name.split('-')[1])
-                existing_steps.add(step)
-            except (ValueError, IndexError):
-                continue
+        # First get all existing checkpoint steps
+        existing_steps = set()
+        for item in output_path.iterdir():
+            if item.is_dir() and item.name.startswith('checkpoint-'):
+                try:
+                    step = int(item.name.split('-')[1])
+                    existing_steps.add(step)
+                except (ValueError, IndexError):
+                    continue
     
-    # Then match with log_history
-    for entry in reversed(state.log_history):
-        if 'eval_sacrebleu' in entry and 'step' in entry:
-            step = entry['step']
-            if step in existing_steps:
-                checkpoints.append((entry['eval_sacrebleu'], str(output_path / f"checkpoint-{step}"), step))
+        # Then match with log_history
+        for entry in reversed(state.log_history):
+            if 'eval_sacrebleu' in entry and 'step' in entry:
+                step = entry['step']
+                if step in existing_steps:
+                    checkpoints.append((entry['eval_sacrebleu'], str(output_path / f"checkpoint-{step}"), step))
     
-    return sorted(checkpoints, key=lambda x: (-x[0], x[2]))
+        return sorted(checkpoints, key=lambda x: (-x[0], x[2]))
 
     def on_step_end(self, args, state, control, **kwargs):
         # Only run at eval steps
